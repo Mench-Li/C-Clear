@@ -1,8 +1,8 @@
 # C-Clear · C盘清理助手
 
-面向 **DeepSeek Harness（DSH）** 的动态 Cordis 插件，用于 Windows 上自动识别、清理 C 盘占用，并把可搬的数据一对一迁到 D 盘。
+面向 **DeepSeek Harness（DSH）** 的 C 盘清理插件，用于 Windows 上自动识别、清理 C 盘占用，并把可搬的数据一对一迁到 D 盘。
 
-> 这是一个 **Cordis 动态插件**：通过 `cordis_define` + `cordis_run` 挂载到当前 DSH 进程。它只活在进程内存里，进程重启即失效（磁盘上的迁移成果不受影响）；如需常驻，可将其固化进 DSH 宿主配置 `cordis.yml`。
+> 当前版本是 **正式 DSH 预设插件**（宿主 HTTP 面板），固化在本地预设里，**重启不失效**。历史版本（`plugin/` 下的动态 Cordis 插件）已保留作参考。
 
 ## 两个清理方向
 
@@ -25,24 +25,41 @@
 ```
 C-Clear/
 ├── README.md
-├── plugin/
-│   ├── host.js          # Host 半体：目录枚举、扫描、判定、清理、迁移、回滚
-│   └── client.js        # Client 半体：React 面板（①②③④四区）
+├── preset/                     # 正式持久化预设（当前版本）
+│   ├── preset.yml              #   预设元数据（名称/描述）
+│   ├── agent.cordis.yml        #   组合：standard 全量能力 + cclean 插件行
+│   └── plugins/
+│       └── cclean.mjs          #   宿主插件：/cclean 网页 + /cclean/api/* JSON RPC
+├── plugin/                     # 历史动态插件（进程内，重启失效）
+│   ├── host.js
+│   └── client.js
 ├── scripts/
 │   └── pause-and-purge-windows-update.ps1   # 提权：暂停更新 + 清空更新缓存
 └── docs/
-    └── design.md        # 设计说明与迁移账本
+    └── design.md
 ```
 
-## 在 DSH 中使用
+## 安装（DSH 预设）
 
-1. `cordis_define`（`kind: 'new'`，`idPrefix: 'cclean'`），把 `plugin/host.js` 的内容作为 `code.host`、`plugin/client.js` 的内容作为 `code.client`。
-2. `cordis_run`（`mode: 'run'`）。
-3. 浏览器里批准插件卡片（建议 ✅✅ 双勾），刷新页面，面板即出现在 Run 卡片上并自动扫描。
+把 `preset/` 整目录复制到本地预设根目录，并把默认预设设为 `cclean`：
+
+```powershell
+$root = Join-Path $HOME '.dsh\.agent-presets'
+Copy-Item .\preset (Join-Path $root 'cclean') -Recurse -Force
+# settings.yaml 中： agent-presets.default: cclean
+```
+
+重启 DSH 后，面板即常驻：
+
+```
+http://127.0.0.1:3080/cclean
+```
+
+插件是**宿主侧 HTTP 面板**：`GET /cclean` 返回自包含网页，`POST /cclean/api/*` 是 JSON RPC（`catalog`/`scan`/`judge`/`clean`/`relocate`/`appdataScan`/`addTarget`/`reAddTarget`），消费宿主 `webServer` 与 `shell` 服务、不发布任何服务，故无需 isolate realm，可安全放进预设。
 
 ## 环境要求
 
-- Windows，C/D 双盘（迁移目标默认 `D:\CRelocated`，可改）。
+- Windows，C/D 双盘（迁移目标默认 `D:\CRelocated`，面板里可改）。
 - DSH 会话文件策略为 `danger-full-access`（迁移/清理/判定需要）。
 - 部分系统级清理与更新缓存清理需要 UAC 提权（脚本会弹窗）。
 
