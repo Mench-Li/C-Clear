@@ -13,7 +13,7 @@ return {
     let lastAppdata = []
     let chain = Promise.resolve()
 
-    const WS_ROOT = 'D:\\project\\DSH'
+    const WS_ROOT = 'E:\\Project\\DSH'
     const POLICY_RW = { mode: 'workspace-write', workspaceRoot: WS_ROOT }
     const POLICY_FULL = { mode: 'danger-full-access', workspaceRoot: WS_ROOT }
 

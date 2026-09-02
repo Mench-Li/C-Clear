@@ -12,9 +12,13 @@ export function apply(ctx) {
   let customInfo = []
   let targets = []
   let lastAppdata = []
-  let chain = Promise.resolve()
+  // Write operations (clean/relocate) run serially on their own chain so two
+  // robocopy/delete jobs never hit the disk at once. Read-only calls
+  // (catalog/scan/judge/appdataScan) run concurrently without enqueueing so a
+  // slow scan never blocks the panel or a user's click behind it.
+  let writeChain = Promise.resolve()
 
-  const WS_ROOT = 'D:\\project\\DSH'
+  const WS_ROOT = 'E:\\Project\\DSH'
   const POLICY_RW = { mode: 'workspace-write', workspaceRoot: WS_ROOT }
   const POLICY_FULL = { mode: 'danger-full-access', workspaceRoot: WS_ROOT }
 
@@ -37,13 +41,19 @@ export function apply(ctx) {
       }
     })
   }
-  const enqueue = function (fn) {
-    const next = chain.then(fn, fn)
-    chain = next.then(function () {}, function (e) {
-      console.error('[cclean] operation failed:', (e && e.message) || e)
+  // Serialize one write operation behind any earlier writes. A rejected write
+  // must not poison the rest of the chain, so the continuation swallows it.
+  const write = function (fn) {
+    const next = writeChain.then(fn, fn)
+    writeChain = next.then(function () {}, function (e) {
+      console.error('[cclean] write failed:', (e && e.message) || e)
     })
     return next
   }
+  // Read-only RPCs run immediately and independently; each returns its own
+  // promise. Only clean/relocate serialize (via write), because two robocopy
+  // runs or deletes in flight would race on the same source directory.
+  const concurrent = function (fn) { return Promise.resolve().then(fn) }
   const fail = function (msg) { return { ok: false, error: msg } }
   const sandboxBlocked = function (r) {
     return r.sandboxDenied === true
@@ -123,9 +133,8 @@ export function apply(ctx) {
     "  }",
     "}",
     "$driveRows = @()",
-    "foreach ($d in @('C','D')) {",
-    "  $pd = Get-PSDrive -Name $d -ErrorAction SilentlyContinue",
-    "  if ($pd -and $pd.Free) { $driveRows = $driveRows + @([pscustomobject]@{ drive=$d; free=[long]$pd.Free; used=[long]$pd.Used }) }",
+    "foreach ($pd in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {",
+    "  if ($pd -and $pd.Free -and $pd.Name -match '^[A-Za-z]$') { $driveRows = $driveRows + @([pscustomobject]@{ drive=$pd.Name; free=[long]$pd.Free; used=[long]$pd.Used }) }",
     "}",
     "[pscustomobject]@{ targets=@($global:list); drives=@($driveRows) } | ConvertTo-Json -Depth 5 -Compress"
   ].join('\n')
@@ -166,7 +175,8 @@ export function apply(ctx) {
     ].join('\n')
   }
 
-  const judgePs = function (path, size) {
+  const judgePs = function (path, size, letter) {
+    const L = String(letter || 'D').replace(/[^A-Za-z]/, '').toUpperCase()
     return [
       "$ErrorActionPreference = 'SilentlyContinue'",
       "$p = " + psq(path),
@@ -175,17 +185,17 @@ export function apply(ctx) {
       "if (-not (Test-Path -LiteralPath $p)) { Out-J $false '路径不存在'; exit 0 }",
       "$it = Get-Item -LiteralPath $p -Force",
       "if ($it -and $it.LinkType) { Out-J $false ('已是指向 ' + (@($it.Target) -join ';') + ' 的链接，无需重复迁移'); exit 0 }",
-      "$pd = Get-PSDrive -Name 'D' -ErrorAction SilentlyContinue",
-      "if (-not ($pd -and $pd.Free)) { Out-J $false '未找到D盘'; exit 0 }",
+      "$pd = Get-PSDrive -Name " + psq(L) + " -ErrorAction SilentlyContinue",
+      "if (-not ($pd -and $pd.Free)) { Out-J $false ('未找到目标盘 ' + " + psq(L) + "); exit 0 }",
       "$need = [long]($size * 1.05) + 67108864",
-      "if ($pd.Free -lt $need) { Out-J $false ('D盘空间不足：需要约 ' + [long]($need / 1MB) + ' MB，D盘剩余 ' + [long]($pd.Free / 1GB) + ' GB'); exit 0 }",
+      "if ($pd.Free -lt $need) { Out-J $false ('目标盘空间不足：需要约 ' + [long]($need / 1MB) + ' MB，" + L + "盘剩余 ' + [long]($pd.Free / 1GB) + ' GB'); exit 0 }",
       "$parent = Split-Path -Parent $p",
       "$leaf = Split-Path -Leaf $p",
       "$probe = '__cc_probe_' + [guid]::NewGuid().ToString('N').Substring(0,8)",
       "$locked = $false; $derr = ''",
       "try { Rename-Item -LiteralPath $p -NewName $probe -ErrorAction Stop } catch { $locked = $true; $derr = $_.Exception.Message }",
       "if (-not $locked) { try { Rename-Item -LiteralPath (Join-Path $parent $probe) -NewName $leaf -ErrorAction Stop } catch { $locked = $true; $derr = $_.Exception.Message } }",
-      "if ($locked) { Out-J $false ('目录被占用：有程序正在使用其中的文件，请先关闭相关程序（IDE/构建进程/守护进程）后重试。' + $derr) } else { Out-J $true '检查通过：无系统限制、无文件占用、D盘空间足够' }"
+      "if ($locked) { Out-J $false ('目录被占用：有程序正在使用其中的文件，请先关闭相关程序（IDE/构建进程/守护进程）后重试。' + $derr) } else { Out-J $true '检查通过：无系统限制、无文件占用、目标盘空间足够' }"
     ].join('\n')
   }
 
@@ -305,7 +315,7 @@ export function apply(ctx) {
   const dispatch = function (method, args) {
     const p = args && args.path
     if (method === 'catalog') {
-      return enqueue(function () {
+      return concurrent(function () {
         return psRun(CATALOG_PS, 60000, POLICY_FULL).then(function (r) {
           if (r.timedOut) return fail('目录枚举超时')
           const blocked = sandboxBlocked(r); if (blocked) return blocked
@@ -318,7 +328,7 @@ export function apply(ctx) {
       })
     }
     if (method === 'appdataScan') {
-      return enqueue(function () {
+      return concurrent(function () {
         return psRun(APPDATA_PS, 600000, POLICY_RW).then(function (r) {
           if (r.timedOut) return fail('AppData 扫描超时（目录过大）')
           const blocked = sandboxBlocked(r); if (blocked) return blocked
@@ -349,7 +359,7 @@ export function apply(ctx) {
       const custom = {
         id: 'custom|' + p, kind: 'relocate', name: String(item.name || '自选目录'), category: 'AppData自选',
         path: p, cleanMode: '', admin: false, cleanable: false, relocatable: true,
-        note: '从AppData排行加入：迁移前自动探测占用与D盘空间，失败自动回滚', exists: true, linkType: null
+        note: '从AppData排行加入：迁移前自动探测占用与目标盘空间，失败自动回滚', exists: true, linkType: null
       }
       customTargets.push(custom)
       rebuildTargets()
@@ -371,7 +381,7 @@ export function apply(ctx) {
     if (method === 'scan') {
       const t = findTarget(p)
       if (!t) return Promise.resolve(fail('未知路径（请先刷新目录）'))
-      return enqueue(function () {
+      return concurrent(function () {
         return psRun(scanPs(p), 600000, POLICY_RW).then(function (r) {
           if (r.timedOut) return fail('统计超时（目录过大）')
           const blocked = sandboxBlocked(r); if (blocked) return blocked
@@ -385,8 +395,11 @@ export function apply(ctx) {
       const t = findTarget(p)
       if (!t || !t.relocatable) return Promise.resolve(fail('该路径不支持迁移判定'))
       const size = Math.max(0, Number(args && args.sizeBytes) || 0)
-      return enqueue(function () {
-        return psRun(judgePs(p, size), 120000, POLICY_FULL).then(function (r) {
+      const dstRoot = String((args && args.dstRoot) || 'D:\\CRelocated').trim()
+      const dm = dstRoot.match(/^([A-Za-z]):/)
+      const letter = dm ? dm[1].toUpperCase() : (String(args && args.letter || 'D').replace(/[^A-Za-z]/, '').toUpperCase() || 'D')
+      return concurrent(function () {
+        return psRun(judgePs(p, size, letter), 120000, POLICY_FULL).then(function (r) {
           const blocked = sandboxBlocked(r); if (blocked) return blocked
           const data = extractJson(r.out)
           if (!data) return fail('判定输出无法解析')
@@ -412,7 +425,7 @@ export function apply(ctx) {
         return Promise.resolve({ ok: true, removed: 0, failed: 0, freedBytes: 0, note: '路径不存在（未安装），已跳过' })
       }
       const mode = t.cleanMode || 'children'
-      return enqueue(function () {
+      return write(function () {
         return psRun(cleanPs(t.path, mode), 600000, POLICY_FULL).then(function (r) {
           const blocked = sandboxBlocked(r); if (blocked) return blocked
           const data = extractJson(r.out)
@@ -425,7 +438,7 @@ export function apply(ctx) {
       const t = findTarget(p)
       if (!t || !t.relocatable) return Promise.resolve(fail('该路径不支持迁移'))
       let dstRoot = String((args && args.dstRoot) || 'D:\\CRelocated').trim()
-      if (!/^[A-Za-z]:\\[^"*?:<>|\r\n]+$/i.test(dstRoot)) return Promise.resolve(fail('目标目录需为形如 D:\\CRelocated 的绝对路径'))
+      if (!/^[A-Za-z]:\\[^"*?:<>|\r\n]+$/i.test(dstRoot)) return Promise.resolve(fail('目标目录需为形如 E:\\CRelocated 的绝对路径（E 换成你想用的目标盘盘符）'))
       dstRoot = dstRoot.replace(/[\\]+$/, '')
       const letter = dstRoot.charAt(0).toUpperCase()
       if (letter === 'C') return Promise.resolve(fail('目标目录不能位于C盘'))
@@ -436,7 +449,7 @@ export function apply(ctx) {
         const leaf = t.path.split('\\').pop()
         dstName = (t.id && t.id.indexOf('|') === -1) ? String(t.id) : (leaf || 'dir').replace(/[\\/:*?"<>|]/g, '')
       }
-      return enqueue(function () {
+      return write(function () {
         return psRun(relocatePs(t.path, dstRoot, letter, wantShortcut, safeName, dstName), 900000, POLICY_FULL).then(function (r) {
           const blocked = sandboxBlocked(r); if (blocked) return blocked
           const data = extractJson(r.out)
@@ -520,7 +533,7 @@ export function apply(ctx) {
     '.log{max-height:180px;overflow:auto;border:1px dashed #444;border-radius:6px;padding:5px 9px;margin-top:14px;white-space:pre-wrap;font-size:11px}',
     '.rank{border-bottom:1px dashed #333;padding:3px 5px}',
     '</style></head><body><div class="wrap" id="app"></div><script>',
-    'var state={targets:[],info:{},drives:[],checked:{},dstRoot:"D:\\\\CRelocated",wantLnk:true,confirmPath:null,adItems:[],sizeSort:true,busy:false};',
+    'var state={targets:[],info:{},drives:[],checked:{},dstRoot:"D:\\\\CRelocated",dstTouched:false,wantLnk:true,confirmPath:null,adItems:[],sizeSort:true,busy:false};',
     'function api(m,a){return fetch("/cclean/api/"+m,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(a||{})}).then(function(r){return r.json()})}',
     'function fmtB(n){if(n===null||n===undefined||isNaN(Number(n)))return"—";var v=Number(n),u=["B","KB","MB","GB","TB"],i=0;while(v>=1024&&i<u.length-1){v/=1024;i++}return (i===0?String(Math.round(v)):v.toFixed(1))+" "+u[i]}',
     'function fmtC(n){if(n===null||n===undefined)return"";return n>=10000?(n/10000).toFixed(1)+"万":String(n)}',
@@ -555,23 +568,29 @@ export function apply(ctx) {
     '    h+="</div><div class=\\"path\\">"+esc(t.path)+"</div>";',
     '    if(t.note)h+="<div class=\\"note\\">· "+esc(t.note)+"</div>";',
     '    h+="</div>"}',
-    '  h+="<div class=\\"sec\\">② 迁移到D盘（每个文件夹一对一迁移）<button id=\\"b-scanrelo\\">扫描本区</button></div>";',
-    '  h+="<div class=\\"row\\"><span>D盘存放根目录：</span><input type=\\"text\\" id=\\"dst\\" value=\\""+esc(state.dstRoot)+"\\"><label><input type=\\"checkbox\\" id=\\"lnk\\""+(state.wantLnk?" checked":"")+"> 迁移后在桌面创建快捷方式</label></div>";',
-    '  h+="<div class=\\"sub\\">一一对应：C盘每个文件夹 → 存放根目录下各自的子文件夹；C盘原路径建立目录联接，程序仍按原路径访问。</div>";',
+    '  h+="<div class=\\"sec\\">② 迁移到指定盘（每个文件夹一对一迁移）<button id=\\"b-scanrelo\\">扫描本区</button></div>";',
+    '  h+="<div class=\\"row\\"><span>目标盘根目录：</span><select id=\\"dstsel\\">";',
+    '  var nd=state.drives.filter(function(d){return String(d.drive).toUpperCase()!=="C"});',
+    '  var curL=((state.dstRoot||"").match(/^([A-Za-z]):/)||[])[1];curL=curL?curL.toUpperCase():"D";',
+    '  if(!nd.length)h+="<option value=\\"\\">（未检测到非C盘）</option>";',
+    '  for(var di=0;di<nd.length;di++){var dv=String(nd[di].drive).toUpperCase();h+="<option value=\\""+dv+"\\""+(dv===curL?" selected":"")+">"+dv+" 盘（剩余 "+fmtB(nd[di].free)+"）</option>"}',
+    '  h+="</select><input type=\\"text\\" id=\\"dst\\" value=\\""+esc(state.dstRoot)+"\\"><label><input type=\\"checkbox\\" id=\\"lnk\\""+(state.wantLnk?" checked":"")+"> 迁移后在桌面创建快捷方式</label></div>";',
+    '  h+="<div class=\\"sub\\">一一对应：C盘每个文件夹 → 目标盘根目录下各自的子文件夹；C盘原路径建立目录联接，程序仍按原路径访问。可下拉选盘符或直接改路径（不能选C盘）。</div>";',
     '  if(!relo.length)h+="<div class=\\"note\\">未发现可迁移项</div>";',
     '  for(i=0;i<relo.length;i++){t=relo[i];s=stOf(t.path);',
     '    h+="<div class=\\"item\\""+(t.exists===false?" style=\\"opacity:.45\\"":"")+"><div class=\\"row\\"><strong>"+esc(t.name)+"</strong><span class=\\"size\\">"+esc(subText(t))+"</span>";',
     '    if(t.admin)h+=badge("warn","需管理员");',
     '    if(s.linkType)h+=badge("ok","已是链接");',
-    '    if(s.judging)h+=badge("","检测中…");else if(s.movable===true)h+=badge("ok","可迁移");else if(s.movable===false&&s.reason)h+=badge("bad","不可迁移");',
-    '    if(s.status==="move")h+=badge("","迁移中…");',
+    '    if(s.judging)h+=badge("","检测中…");else if(s.status==="move")h+=badge("","迁移中…");else if(s.status==="moved")h+=badge("ok","已迁移");else if(s.status==="err")h+=badge("bad","迁移失败");else if(s.movable===true)h+=badge("ok","可迁移");else if(s.movable===false&&s.reason)h+=badge("bad","不可迁移");',
     '    h+="</div><div class=\\"path\\">"+esc(t.path)+"</div>";',
-    '    if(s.reason)h+="<div class=\\"note\\">· "+esc(s.reason)+"</div>";',
+    '    if(s.status==="err"&&s.reason)h+="<div class=\\"note\\">· "+esc(s.reason)+"</div>";',
+    '    if(s.reason&&s.status!=="err")h+="<div class=\\"note\\">· "+esc(s.reason)+"</div>";',
     '    if(t.note)h+="<div class=\\"note\\">· "+esc(t.note)+"</div>";',
-    '    if(t.exists){h+="<div class=\\"row\\"><button data-judge=\\""+esc(t.path)+"\\">重新检测</button>";',
+    '    if(t.exists&&s.status!=="moved"){h+="<div class=\\"row\\"><button data-judge=\\""+esc(t.path)+"\\">"+(s.status==="err"?"重试检测":"重新检测")+"</button>";',
     '      if(state.confirmPath===t.path){h+="<button class=\\"danger\\" data-relocate=\\""+esc(t.path)+"\\">确认迁移！</button><button data-cancel=\\""+esc(t.path)+"\\">取消</button>"}',
     '      else h+="<button "+(s.movable!==true?"disabled":"")+" data-relocate=\\""+esc(t.path)+"\\">迁移</button>";',
-    '      h+="</div>"}}',
+    '    h+="</div>"}',
+    '    h+="</div>"}',
     '  h+="<div class=\\"sec\\">③ 系统强制C盘（仅供参考，本工具不会改动）<button id=\\"b-scaninfo\\">统计本区（较慢）</button></div>";',
     '  for(i=0;i<infos.length;i++){t=infos[i];s=stOf(t.path);var sysRe=(String(t.id).indexOf("sysinfo|")===0);',
     '    h+="<div class=\\"item\\"><div class=\\"row\\"><strong>"+esc(t.name)+"</strong><span class=\\"size\\">"+esc(subText(t))+"</span>"+badge("bad","不可移动");',
@@ -594,13 +613,13 @@ export function apply(ctx) {
     '  h+="<div class=\\"log\\" id=\\"log\\">操作日志（扫描/清理/迁移结果都会显示在这里）</div>";',
     '  el("app").innerHTML=h}',
     'function rootLabel(r){var s=String(r||"").toLowerCase();if(s.indexOf("roaming")!==-1)return "Roaming";if(s.indexOf("locallow")!==-1)return "LocalLow";return "Local"}',
-    'function loadCatalog(){return api("catalog").then(function(r){if(!r||r.ok===false){log("加载失败："+((r&&r.error)||""));return}state.targets=r.targets||[];state.drives=r.drives||[];render()})}',
+    'function loadCatalog(){return api("catalog").then(function(r){if(!r||r.ok===false){log("加载失败："+((r&&r.error)||""));return}state.targets=r.targets||[];state.drives=r.drives||[];if(!state.dstTouched){var cur=((state.dstRoot||"").match(/^([A-Za-z]):/)||[])[1];var has=state.drives.some(function(d){return String(d.drive).toUpperCase()===String(cur||"").toUpperCase()});if(!has){var first=state.drives.filter(function(d){return String(d.drive).toUpperCase()!=="C"})[0];if(first)state.dstRoot=String(first.drive).toUpperCase()+":\\\\CRelocated"}}render()})}',
     'function scanOne(p,withJudge){state.info[p]={status:"scan"};render();return api("scan",{path:p}).then(function(r){if(r&&r.ok!==false&&r.error===undefined){state.info[p]={status:"done",exists:r.exists!==false,sizeBytes:r.exists===false?0:r.sizeBytes,files:r.files,linkType:r.linkType||null}}else state.info[p]={status:"error",msg:(r&&r.error)||"统计失败"};if(withJudge)return judge(p);render()})}',
-    'function judge(p){var cur=state.info[p]||{};state.info[p]=Object.assign({},cur,{judging:true});render();return api("judge",{path:p,sizeBytes:cur.sizeBytes||0}).then(function(r){if(r&&r.reclassified){log("「"+p+"」重命名探测被拒，已归入③区");return loadCatalog()}if(r&&r.ok!==false){state.info[p]=Object.assign({},state.info[p],{judging:false,movable:r.movable===true,reason:r.reason||""})}else state.info[p]=Object.assign({},state.info[p],{judging:false,movable:false,reason:(r&&r.error)||"判定失败"});render()})}',
-    'function scanAll(){var list=state.targets.filter(function(t){return (t.cleanable||t.relocatable)&&t.cleanMode!=="recycle"&&t.exists});var i=0;(function next(){if(i>=list.length){scanAppdata();return}scanOne(list[i].path,true).then(function(){i++;next()})})()}',
+    'function judge(p){var cur=state.info[p]||{};state.info[p]=Object.assign({},cur,{judging:true});render();return api("judge",{path:p,sizeBytes:cur.sizeBytes||0,dstRoot:state.dstRoot}).then(function(r){if(r&&r.reclassified){log("「"+p+"」重命名探测被拒，已归入③区");return loadCatalog()}if(r&&r.ok!==false){state.info[p]=Object.assign({},state.info[p],{judging:false,movable:r.movable===true,reason:r.reason||""})}else state.info[p]=Object.assign({},state.info[p],{judging:false,movable:false,reason:(r&&r.error)||"判定失败"});render()})}',
+    'function scanAll(){var list=state.targets.filter(function(t){return (t.cleanable||t.relocatable)&&t.cleanMode!=="recycle"&&t.exists});if(!list.length){scanAppdata();return}Promise.all(list.map(function(t){return scanOne(t.path,true)})).then(function(){scanAppdata()},function(){scanAppdata()})}',
     'function scanAppdata(){state.adItems=[];render();api("appdataScan").then(function(r){if(r&&r.ok){state.adItems=r.items||[];log("✓ AppData 扫描完成："+state.adItems.length+" 个顶层目录")}else log("× AppData 扫描失败："+((r&&r.error)||""));render()})}',
     'function cleanChecked(){var list=state.targets.filter(function(t){return t.cleanable&&state.checked[t.path]});if(!list.length){log("请先勾选要清理的项目");return}state.busy=true;var i=0;(function next(){if(i>=list.length){state.busy=false;log("清理完成");loadCatalog();return}var t=list[i];state.info[t.path]={status:"clean"};render();api("clean",{path:t.path}).then(function(r){var freed=Math.max(0,(r&&r.freedBytes)||0);if(r&&r.ok)log("✓ "+t.name+"：清理 "+r.removed+" 项，释放约 "+fmtB(freed)+((r&&r.note)?"（"+r.note+"）":""));else log("△ "+t.name+"："+((r&&r.error)||("失败 "+(r&&r.failed)+" 项")));state.info[t.path]={status:"done",sizeBytes:0,files:0,cleaned:true};state.checked={};i++;next()})})()}',
-    'function relocate(p){if(state.confirmPath!==p){state.confirmPath=p;render();return}var s=state.info[p]||{};if(s.movable!==true){state.confirmPath=null;judge(p);return}state.confirmPath=null;state.info[p]={status:"move"};render();var t=state.targets.find(function(x){return x.path===p});var dstName=String(p.split("\\\\").pop()||"dir").replace(/[\\\\/:*?"<>|]/g,"");api("relocate",{path:p,dstRoot:state.dstRoot,shortcut:state.wantLnk,dstName:dstName}).then(function(r){if(r&&r.ok){log("✓ 已迁移 → "+r.dst+"；C盘原路径已建立目录联接"+(r.shortcut?"；已创建桌面快捷方式":""));state.info[p]={status:"moved",movable:false,sizeBytes:0,reason:"已迁移至 "+r.dst}}else{log("× 迁移失败："+((r&&r.error)||"未知错误"));state.info[p]={status:"error",msg:(r&&r.error)||"迁移失败"}}loadCatalog()})}',
+    'function relocate(p){if(state.confirmPath!==p){state.confirmPath=p;render();return}var s=state.info[p]||{};if(s.movable!==true){state.confirmPath=null;judge(p);return}state.confirmPath=null;state.info[p]={status:"move",movable:true};render();log("开始迁移：「"+p+"」→ "+(state.dstRoot||"?"));var t=state.targets.find(function(x){return x.path===p});var dstName=String(p.split("\\\\").pop()||"dir").replace(/[\\\\/:*?"<>|]/g,"");api("relocate",{path:p,dstRoot:state.dstRoot,shortcut:state.wantLnk,dstName:dstName}).then(function(r){if(r&&r.ok){state.info[p]={status:"moved",movable:false,sizeBytes:0,reason:"已迁移至 "+r.dst};log("✓ 已迁移 → "+r.dst+"；C盘原路径已建立目录联接"+(r.shortcut?"；已创建桌面快捷方式":""))}else{var e=(r&&r.error)||"未知错误";state.info[p]={status:"err",movable:false,reason:e};log("× 「"+p+"」迁移失败："+e)}render();loadCatalog()})}',
     'document.addEventListener("click",function(ev){var b=ev.target.closest("button");var ck=ev.target.closest("input[data-ck]");if(!b&&!ck)return;if(ck){state.checked[ck.getAttribute("data-ck")]=ck.checked;return}var id=b.id,d;',
     '  if(id==="b-refresh"){loadCatalog().then(function(){log("目录已刷新，共 "+state.targets.length+" 个关注项")})}',
     '  else if(id==="b-scanall")scanAll();',
@@ -613,11 +632,12 @@ export function apply(ctx) {
     '  else if(d=b.getAttribute("data-judge"))judge(d);',
     '  else if(d=b.getAttribute("data-relocate"))relocate(d);',
     '  else if(d=b.getAttribute("data-cancel")){state.confirmPath=null;render()}',
-    '  else if(d=b.getAttribute("data-add")){api("addTarget",{path:d}).then(function(r){if(r&&r.ok){log("✓ 已加入迁移："+d);loadCatalog().then(function(){judge(d)})}else log("× 加入失败："+((r&&r.error)||""))})}',
+    '  else if(d=b.getAttribute("data-add")){var addBtn=b;addBtn.disabled=true;api("addTarget",{path:d}).then(function(r){if(r&&r.ok){log("✓ 已加入迁移："+d);loadCatalog().then(function(){judge(d)})}else{log("× 加入失败："+((r&&r.error)||""));render()}})}',
     '  else if(d=b.getAttribute("data-readd")){api("reAddTarget",{path:d}).then(function(r){if(r&&r.ok){log("✓ 已移回②区："+d);loadCatalog().then(function(){judge(d)})}else log("× 移回失败："+((r&&r.error)||""))})}',
     '});',
-    'document.addEventListener("input",function(ev){if(ev.target.id==="dst")state.dstRoot=ev.target.value;if(ev.target.id==="lnk")state.wantLnk=ev.target.checked;});',
-    'loadCatalog().then(function(){var list=state.targets.filter(function(t){return (t.cleanable||t.relocatable)&&t.cleanMode!=="recycle"&&t.exists});var i=0;(function next(){if(i>=list.length){scanAppdata();return}scanOne(list[i].path,true).then(function(){i++;next()})})()});',
+    'document.addEventListener("input",function(ev){if(ev.target.id==="dst"){state.dstRoot=ev.target.value;state.dstTouched=true}if(ev.target.id==="lnk")state.wantLnk=ev.target.checked;});',
+    'document.addEventListener("change",function(ev){if(ev.target.id==="dstsel"){state.dstRoot=ev.target.value+":\\\\CRelocated";state.dstTouched=true;render()}});',
+    'loadCatalog().then(function(){var list=state.targets.filter(function(t){return (t.cleanable||t.relocatable)&&t.cleanMode!=="recycle"&&t.exists});if(!list.length){scanAppdata();return}Promise.all(list.map(function(t){return scanOne(t.path,true)})).then(function(){scanAppdata()},function(){scanAppdata()})});',
     '</script></body></html>'
   ].join('')
 }
